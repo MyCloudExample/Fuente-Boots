@@ -1,0 +1,444 @@
+// ======================================================================================================
+// === FIRMWARE.C: PROYECTO FUENTE DE ALIMENTACIÓN REGULADA (RP2040 + FreeRTOS + PID Adaptativo) ===
+// ======================================================================================================
+
+/*
+// --- CONTEXTO DEL PROYECTO ---
+// Este firmware implementa una fuente de alimentación regulada utilizando la Raspberry Pi Pico
+// y FreeRTOS. Su objetivo principal es:
+// 1. **Control PID:** Mantener el voltaje de salida (V_salida) constante y estable.
+// 2. **Interfaz de Usuario (SetPoint):** Permitir el ajuste del voltaje deseado (V_setpoint)
+//    mediante potenciómetro (grueso) y botones (fino).
+// 3. **RTOS:** Utilizar FreeRTOS para gestionar múltiples funciones (lectura de usuario, control, display)
+//    de forma concurrente y con prioridades bien definidas.
+*/
+
+// --- LIBRERÍAS Y FRAMEWORKS ---
+#include <stdio.h>        // Utilizado para la consola serial (printf).
+#include <math.h>         // Necesario para roundf() (redondeo) y fabs() (valor absoluto para el error).
+#include "pico/stdlib.h"  // Librerías base de la Pico SDK.
+// Librerías de Periféricos del RP2040 (Hardware Abstraction Layer - HAL)
+#include "hardware/i2c.h" // Protocolo de comunicación para el LCD.
+#include "hardware/gpio.h"// Manejo de pines (botones, buzzer).
+#include "hardware/adc.h" // Conversor Analógico-Digital (Lectura de Pot y V_salida).
+#include "hardware/pwm.h" // Modulación por Ancho de Pulso (Actuador de potencia).
+#include "pico/time.h"    // Funciones de manejo de tiempo.
+#include "lcd.h"          // Driver personalizado para el LCD I2C.
+
+// Librerías de FreeRTOS (Sistema Operativo en Tiempo Real)
+#include "FreeRTOS.h"
+#include "task.h"         // Define las unidades de ejecución concurrentes (Tareas).
+#include "queue.h"        // Mecanismo de comunicación y sincronización entre Tareas (Colas).
+#include "semphr.h"       // Semáforos (no usados en esta versión, pero útiles para exclusión mutua).
+
+// --- SECCIÓN 1: CONFIGURACIONES DE HARDWARE (Mapeo de Pines) ---
+
+// LCD I2C
+#define I2C_PORT i2c0
+#define I2C_SDA_PIN 4
+#define I2C_SCL_PIN 5
+#define LCD_ADDR 0x27 // Dirección típica.
+
+// ADC y PWM
+#define POT_PIN 26      // ADC0: Lectura de la referencia deseada (SetPoint).
+#define SALIDA_PIN 27   // ADC1: Lectura de la retroalimentación del voltaje de salida (PV).
+#define PWM_PIN 22      // Salida al circuito de potencia (Actuación).
+#define PWM_FREQ 30000  // Frecuencia del PWM (30 kHz), crítica para la eficiencia del convertidor.
+
+// Botones y Alarma (Interfaz de Usuario Física)
+#define BUZZER_PIN 14
+#define B1_PIN 10       // TOGGLE: Alterna Modo Grueso/Fino (Control de estado).
+#define B2_PIN 11       // UP: Ajuste fino (+0.1V).
+#define B3_PIN 12       // DOWN: Ajuste fino (-0.1V).
+#define B4_PIN 13       // CONFIRM: Aplica el SetPoint fino y vuelve a Grueso (Transición de estado).
+
+// --- SECCIÓN 2: CONSTANTES DEL SISTEMA Y PARÁMETROS DE CONTROL ---
+
+// Limites Físicos y Mapeo
+#define ADC_MAX 4095.0f              // Máximo valor de conversión del ADC de 12 bits.
+#define VOLTAJE_MAX_ADC 3.3f         // Voltaje de referencia de la Pico (Vref_ADC).
+#define VOLTAJE_SALIDA_MAX 24.0f     // Límite superior de la fuente.
+#define VOLTAJE_SALIDA_MIN 12.0f     // Límite inferior de la fuente.
+#define DIVISOR_FACTOR 0.1282f       // Factor de atenuación del divisor resistivo (V_salida a V_medido en ADC).
+
+// Coeficientes PID (SINTONIZACIÓN)
+#define KP 34.0f         // Ganancia Proporcional. Alto valor => Respuesta rápida.
+#define KI 7.6f          // Ganancia Integral. Elimina el Error Estacionario.
+#define KD 0.6f          // Ganancia Derivativa. Amortigua y anticipa el error.
+#define UMBRAL_ERROR 3.5f// Valor clave para la lógica Adaptativa (PI vs PD).
+
+// Pasos para Setpoint (Control de Interfaz de Usuario)
+#define STEP_GRUERO 0.5f // Paso de ajuste por potenciómetro (redondeo a 0.5V).
+#define STEP_FINO 0.1f   // Paso de ajuste por botones.
+
+
+// ======================================================================================================
+// --- SECCIÓN 3: ESTRUCTURA Y LÓGICA DEL CONTROLADOR PID (PID Adaptativo) ---
+// (Lógica de control en Bucle Cerrado)
+
+typedef struct {
+    float Kp, Ki, Kd;               // Coeficientes P, I, D.
+    float integral;                 // Acumulador del error (Término Integral).
+    float previous_error;           // Error de la iteración anterior (Para el Término Derivativo).
+    float dt;                       // Tiempo de muestreo del PID (Delta Time).
+} PIDController_t;
+
+// Función de Inicialización del PID.
+void PID_Init(PIDController_t* pid, float Kp, float Ki, float Kd, float dt) {
+    pid->Kp = Kp;
+    pid->Ki = Ki;
+    pid->Kd = Kd;
+    pid->integral = 0.0f;
+    pid->previous_error = 0.0f;
+    pid->dt = dt;
+}
+
+// Función Principal de Cálculo del PID.
+float PID_Compute(PIDController_t* pid, float setpoint, float process_variable, uint16_t pwm_wrap) {
+    // 1. Cálculo del Error (Error = Setpoint - PV)
+    float error = setpoint - process_variable;
+    
+    // **Protección de control (Solo para fuentes elevadoras)**
+    // Si el error es negativo (V_salida > V_setpoint), no se debe inyectar más potencia.
+    if (error < 0) {
+        pid->integral = 0; // Se resetea la integral (Anti-Windup preventivo).
+        pid->previous_error = 0;
+        return 0; // PWM en 0 (Máxima bajada de voltaje).
+    }
+
+    // 2. Cálculo de Términos Base
+    float proportional_term = pid->Kp * error;
+    float integral_term = 0.0f;
+    float derivative_term = 0.0f;
+    float output_unclipped = 0.0f;
+    
+    // 3. Lógica de Control Adaptativo (PI vs PD)
+    // Se utiliza el Umbral de Error para decidir el modo de control.
+    if (fabs(error) > UMBRAL_ERROR) {
+        // **Modo Transitorio/Rápido (PD)**: Se resetea el integral y se usa Derivativo.
+        derivative_term = pid->Kd * ((error - pid->previous_error) / pid->dt);
+        output_unclipped = proportional_term + derivative_term;
+        pid->integral = 0.0f; // Evita que la integral crezca mientras el error es grande.
+    } else {
+        // **Modo Permanente/Precisión (PI)**: Se acumula la Integral.
+        pid->integral += error * pid->dt;
+        integral_term = pid->Ki * pid->integral;
+        output_unclipped = proportional_term + integral_term;
+        // La Derivativa (KD) se ignora en este modo para evitar ruido en estado estable.
+    }
+    
+    // 4. Implementación de Anti-Windup (Back-Calculation)
+    // Si el cálculo de salida se satura, el término integral se deshace.
+    float temp_output = proportional_term + integral_term;
+    if (temp_output > pwm_wrap || temp_output < 0) {
+        pid->integral -= error * pid->dt; // Deshace la última acumulación integral.
+    }
+    
+    // 5. Actualizar el estado
+    pid->previous_error = error;
+    
+    // 6. Limitar la Salida al rango del PWM (0 a 'wrap')
+    if (output_unclipped > pwm_wrap) {
+        return (float)pwm_wrap;
+    } else if (output_unclipped < 0) {
+        return 0.0f;
+    }
+
+    return output_unclipped; // El valor final es el Duty Cycle (en cuentas PWM).
+}
+
+// ======================================================================================================
+// --- SECCIÓN 4: ESTRUCTURAS Y COLAS DE FREERTOS (Intercambio de Datos) ---
+
+// Estructura de Datos para Setpoint (Producida por vTaskSetPoint)
+typedef struct {
+    float v_setpoint_final;    // **CRUCIAL:** Es la referencia que el PID lee y usa para controlar.
+    float v_display_temp;      // El valor que se muestra en el LCD (puede ser temporal si está en Fino).
+    uint8_t mode;              // 0=GRUERO, 1=FINO (Estado de la interfaz).
+} SetpointData_t;
+
+// Estructura de Datos para Salida (Producida por vTaskPID)
+typedef struct {
+    float v_salida;            // Voltaje medido actualmente (PV).
+    float v_referencia;        // Setpoint que el PID está siguiendo (copia de v_setpoint_final).
+    float duty_cycle;          // Valor del Duty Cycle aplicado (para feedback visual).
+} OutputData_t;
+
+// Colas de Comunicación (Tamaño 1: solo importa el último valor)
+QueueHandle_t xSetPointQueue; // Tarea Setpoint -> (vTaskPID, vTaskLCD).
+QueueHandle_t xOutputQueue;   // Tarea PID -> (vTaskLCD).
+
+
+// --- SECCIÓN 5: FUNCIONES AUXILIARES DE CONVERSIÓN ---
+
+// Conversión: ADC Raw -> Voltaje de la placa (0V a 3.3V)
+float adc_a_voltaje_placa(uint16_t adc_raw) {
+    // Conversión lineal básica
+    return (float)adc_raw / ADC_MAX * VOLTAJE_MAX_ADC;
+}
+
+// Conversión: Voltaje de la placa -> Voltaje de Salida Real (24V)
+float adc_a_voltaje_salida(uint16_t adc_raw) {
+    float v_adc = adc_a_voltaje_placa(adc_raw);
+    // V_real = V_medido / Factor de atenuación
+    return v_adc / DIVISOR_FACTOR;
+}
+
+// Mapeo: ADC Potenciómetro -> Setpoint Discreto (0.5V steps)
+float map_adc_to_discrete(uint16_t adc_val) {
+    float v_placa = adc_a_voltaje_placa(adc_val);
+    
+    // Mapeo lineal (ajustado a la curva de tu circuito para 12V-24V)
+    float v_lineal = 4.0f * v_placa + 10.8f;
+
+    // Redondeo al múltiplo más cercano de 0.5V (STEP_GRUERO).
+    return roundf(v_lineal / STEP_GRUERO) * STEP_GRUERO;
+}
+
+// Lectura de botón con lógica de pull-up (LOW es PRESIONADO)
+bool leer_boton(uint gpio) {
+    return !gpio_get(gpio); 
+}
+
+// ======================================================================================================
+// --- SECCIÓN 6: TAREAS DE FREERTOS (Flujo de Ejecución) ---
+
+// TAREA 1: Setpoint (Lectura de botones y potenciómetro)
+// PRIORIDAD: 3 (Máxima) - Debe reaccionar inmediatamente a la entrada del usuario.
+void vTaskSetPoint(void *pvParameters) {
+    
+    // Inicialización del estado (valores iniciales)
+    SetpointData_t data_tx = {
+        .v_setpoint_final = 12.0f,
+        .v_display_temp = 12.0f,
+        .mode = 0 // Inicia en Modo Grueso (POT)
+    };
+    
+    const TickType_t xDelay = pdMS_TO_TICKS(50); // Muestreo de la interfaz: 50ms.
+    TickType_t xLastButtonPressTime = xTaskGetTickCount(); // Para control de rebote (Debounce).
+
+    while (1) {
+        
+        // --- 1. Botón B1: TOGGLE Grueso/Fino (Cambio de Modo) ---
+        if (leer_boton(B1_PIN) && (xTaskGetTickCount() - xLastButtonPressTime) > pdMS_TO_TICKS(250)) {
+            data_tx.mode = 1 - data_tx.mode; // Alterna 0 (Grueso) <-> 1 (Fino).
+            
+            // Al entrar en Fino, V_temp se alinea a V_final para iniciar el ajuste desde allí.
+            data_tx.v_display_temp = data_tx.v_setpoint_final; 
+            
+            xLastButtonPressTime = xTaskGetTickCount();
+        }
+
+        // --- 2. LÓGICA DE AJUSTE ---
+        if (data_tx.mode == 0) { // MODO GRUESO (Potenciómetro)
+            
+            adc_select_input(0); // Selecciona el pin del potenciómetro.
+            uint16_t adc_pot = adc_read();
+            
+            // V_FINAL es siempre igual al Potenciómetro en este modo.
+            data_tx.v_setpoint_final = map_adc_to_discrete(adc_pot);
+            data_tx.v_display_temp = data_tx.v_setpoint_final; 
+
+        } else { // MODO FINO (Botones B2, B3, B4)
+            
+            bool adjusted = false;
+
+            // B2/B3: Ajusta solo el valor TEMPORAL (V_display_temp)
+            if (leer_boton(B2_PIN)) {
+                data_tx.v_display_temp += STEP_FINO;
+                adjusted = true;
+            }
+            
+            if (leer_boton(B3_PIN)) {
+                data_tx.v_display_temp -= STEP_FINO;
+                adjusted = true;
+            }
+
+            if(adjusted) {
+                vTaskDelay(pdMS_TO_TICKS(100)); // Pequeña pausa para evitar incremento excesivo.
+            }
+            
+            // B4: CONFIRMAR (Aplica V_temp a V_final y vuelve a GRUESO)
+            if (leer_boton(B4_PIN) && (xTaskGetTickCount() - xLastButtonPressTime) > pdMS_TO_TICKS(250)) {
+                data_tx.v_setpoint_final = data_tx.v_display_temp; // ¡Aplico el cambio al PID!
+                data_tx.mode = 0; 
+                xLastButtonPressTime = xTaskGetTickCount();
+            }
+
+            // Limitar V_temp para evitar desbordamiento del display o del circuito.
+            if (data_tx.v_display_temp > VOLTAJE_SALIDA_MAX) data_tx.v_display_temp = VOLTAJE_SALIDA_MAX;
+            if (data_tx.v_display_temp < VOLTAJE_SALIDA_MIN) data_tx.v_display_temp = VOLTAJE_SALIDA_MIN;
+        }
+
+        // --- 3. Comunicación: Envío a Tareas PID y LCD ---
+        xQueueSend(xSetPointQueue, &data_tx, 0); // Envío SIN BLOQUEO (0)
+        
+        vTaskDelay(xDelay); // Espera 50ms.
+    }
+}
+
+// TAREA 2: PID (Lazo de Control y Actuación)
+// PRIORIDAD: 2 (Media-Alta) - La más crítica para la estabilidad (Período: 10ms).
+void vTaskPID(void *pvParameters) {
+    SetpointData_t setpoint_rx;
+    OutputData_t output_tx = {0};
+    
+    // Inicialización del PWM 
+    uint slice_num = pwm_gpio_to_slice_num(PWM_PIN);
+    uint16_t wrap = 125000000 / PWM_FREQ - 1; // Cálculo del contador máximo (wrap).
+    pwm_set_wrap(slice_num, wrap);
+    pwm_set_enabled(slice_num, true);
+
+    const TickType_t xDelay = pdMS_TO_TICKS(10); // Lazo de control más rápido: 10ms
+    const float dt = 0.010f; // 10ms en segundos (para el cálculo integral/derivativo).
+
+    // *** INTEGRACIÓN DE TU PID ***
+    PIDController_t voltage_pid; 
+    PID_Init(&voltage_pid, KP, KI, KD, dt);
+
+    while (1) {
+        
+        // 1. Recepción del Setpoint 
+        // No esperamos, solo tomamos el último valor disponible.
+        if (xQueueReceive(xSetPointQueue, &setpoint_rx, 0) == pdPASS) {
+            output_tx.v_referencia = setpoint_rx.v_setpoint_final; // El Setpoint REAL para el control.
+        }
+
+        // 2. Lectura de la Medición de Salida (ADC1)
+        adc_select_input(1);
+        uint16_t adc_salida = adc_read();
+        output_tx.v_salida = adc_a_voltaje_salida(adc_salida);
+        
+        // 3. Cálculo de la salida de control con TU función PID_Compute
+        float duty_cycle_float = PID_Compute(&voltage_pid, output_tx.v_referencia, output_tx.v_salida, wrap);
+        
+        // 4. Actuación PWM
+        // Limitar la salida
+        if (duty_cycle_float > (float)wrap) duty_cycle_float = (float)wrap;
+        if (duty_cycle_float < 0.0f) duty_cycle_float = 0.0f;
+
+        uint16_t duty_cycle = (uint16_t)duty_cycle_float;
+        
+        // Aplica el Duty Cycle al pin PWM
+        pwm_set_chan_level(slice_num, pwm_gpio_to_channel(PWM_PIN), duty_cycle);
+        output_tx.duty_cycle = duty_cycle_float;
+        
+        // 5. Comunicación: Envío de Salida a Tarea LCD
+        xQueueSend(xOutputQueue, &output_tx, 0); 
+
+        vTaskDelay(xDelay); // Espera 10ms.
+    }
+}
+
+
+// --- TAREA 3: LCD (Manejo del display) ---
+// PRIORIDAD: 1 (Baja) - Es solo feedback visual, no afecta al control.
+void vTaskLCD(void *pvParameters) {
+    SetpointData_t setpoint_rx;
+    OutputData_t output_rx = {0};
+    char line1[17], line2[17];
+    
+    // Inicialización del LCD (Debería hacerse en main, pero se asegura aquí).
+    lcd_init(I2C_PORT, LCD_ADDR); 
+    
+    const TickType_t xDelay = pdMS_TO_TICKS(500); // Actualiza LCD cada 500ms (lento para no consumir ciclos de CPU).
+
+    while (1) {
+        // 1. Leer los últimos valores de las colas
+        // xQueuePeek: Lee sin sacar el dato de la cola (lectura no destructiva).
+        xQueuePeek(xSetPointQueue, &setpoint_rx, 0); 
+        xQueuePeek(xOutputQueue, &output_rx, 0); 
+
+        // 2. Formato del LCD
+        
+        // LINEA 1: Setpoint y Modo
+        if (setpoint_rx.mode == 0) {
+            // MODO GRUESO: Muestra V_FINAL que está usando el PID.
+            sprintf(line1, "Ref: %.2f V GRUE", setpoint_rx.v_setpoint_final);
+        } else {
+            // MODO FINO: Muestra V_TEMP que el usuario está ajustando.
+            sprintf(line1, "Ref: %.2f V FINO", setpoint_rx.v_display_temp);
+        }
+
+        // LINEA 2: Salida y PWM
+        uint16_t wrap = 125000000 / PWM_FREQ - 1;
+        int duty_percent = (int)(output_rx.duty_cycle / (float)wrap * 100);
+
+        // Lógica de Alarma (por si el voltaje está fuera de rango)
+        if (output_rx.v_salida > VOLTAJE_SALIDA_MAX || output_rx.v_salida < VOLTAJE_SALIDA_MIN) {
+             gpio_put(BUZZER_PIN, 1); // Activa la alarma sonora.
+             sprintf(line2, "ALERTA: %.2f V", output_rx.v_salida);
+        } else {
+             gpio_put(BUZZER_PIN, 0); // Desactiva la alarma.
+             sprintf(line2, "Out: %.2f V PWM:%d%%", output_rx.v_salida, duty_percent);
+        }
+        
+        // 3. Escritura en LCD
+        lcd_clear();
+        lcd_set_cursor(0, 0); 
+        lcd_string(line1);
+        lcd_set_cursor(1, 0);
+        lcd_string(line2);
+        
+        vTaskDelay(xDelay); // Espera 500ms.
+    }
+}
+
+
+// --- SECCIÓN 7: MAIN (Inicialización y Arranque del RTOS) ---
+
+void init_hardware() {
+    // 1. Inicialización de Periféricos del RP2040
+    i2c_init(I2C_PORT, 100 * 1000); // I2C a 100 kHz.
+    gpio_set_function(I2C_SDA_PIN, GPIO_FUNC_I2C);
+    gpio_set_function(I2C_SCL_PIN, GPIO_FUNC_I2C);
+    gpio_pull_up(I2C_SDA_PIN);
+    gpio_pull_up(I2C_SCL_PIN);
+    lcd_init(I2C_PORT, LCD_ADDR); // Inicializa el LCD.
+
+    adc_init(); // Inicializa el ADC del RP2040.
+    adc_gpio_init(POT_PIN); // Habilita ADC en el pin del potenciómetro.
+    adc_gpio_init(SALIDA_PIN); // Habilita ADC en el pin de medición de salida.
+
+    gpio_set_function(PWM_PIN, GPIO_FUNC_PWM); // Configura el pin PWM.
+    
+    // 2. Inicialización de Pines GPIO (Botones y Buzzer)
+    gpio_init(BUZZER_PIN); gpio_set_dir(BUZZER_PIN, GPIO_OUT); gpio_put(BUZZER_PIN, 0);
+    // Configura Botones como INPUT con Pull-up (para lectura segura).
+    gpio_init(B1_PIN); gpio_set_dir(B1_PIN, GPIO_IN); gpio_pull_up(B1_PIN);
+    gpio_init(B2_PIN); gpio_set_dir(B2_PIN, GPIO_IN); gpio_pull_up(B2_PIN);
+    gpio_init(B3_PIN); gpio_set_dir(B3_PIN, GPIO_IN); gpio_pull_up(B3_PIN);
+    gpio_init(B4_PIN); gpio_set_dir(B4_PIN, GPIO_IN); gpio_pull_up(B4_PIN);
+}
+
+
+int main() {
+    stdio_init_all();
+    init_hardware();
+    printf("Iniciando fuente con FreeRTOS, Setpoint mejorado y PID integrado...\n");
+
+    // --- 3. Creación de Colas (Comunicación) ---
+    // Tamaño 1 significa que la cola siempre contiene solo el último valor.
+    xSetPointQueue = xQueueCreate(1, sizeof(SetpointData_t));
+    xOutputQueue = xQueueCreate(1, sizeof(OutputData_t));
+
+    if (xSetPointQueue == NULL || xOutputQueue == NULL) {
+        printf("ERROR: Fallo al crear las colas de FreeRTOS.\n");
+        return -1;
+    }
+
+
+    // --- 4. Creación de Tareas (Prioridades: 3 > 2 > 1) ---
+    // TaskCreate(Puntero_Funcion, Nombre, Tamaño_Stack, Parámetros, Prioridad, Puntero_TaskHandle)
+    xTaskCreate(vTaskSetPoint, "SetpointTask", configMINIMAL_STACK_SIZE, NULL, 3, NULL); // Máxima prioridad (reactividad UI)
+    xTaskCreate(vTaskPID, "PIDTask", configMINIMAL_STACK_SIZE, NULL, 2, NULL);         // Prioridad media-alta (lazo de control)
+    xTaskCreate(vTaskLCD, "LCDTask", configMINIMAL_STACK_SIZE, NULL, 1, NULL);         // Prioridad baja (display)
+
+
+    // --- 5. Inicio del Scheduler (El corazón del RTOS) ---
+    vTaskStartScheduler();
+    
+    while (1); // El código nunca debería llegar aquí si el scheduler arranca correctamente.
+    
+    return 0;
+}
