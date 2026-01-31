@@ -42,7 +42,15 @@
 /*===============================================VARIABLES DEL CODIGO============================================================*/
 static uint32_t pwm_wrap;
 static uint slice_num, channel;
+typedef struct
+{
+    float valor;
+    float decena;
+    float unidad;
+    float decimal;
+}dato_t;
 QueueHandle_t duty_queue;
+QueueHandle_t queue_set;
 /*===============================================FUNCIONES DEL CODIGO============================================================*/
 //===============================================LECTURA DEL ADC0 PARA AJURTAR EL DUTY DEL SETPOINT===============================
 float read_potentiometer() {
@@ -71,7 +79,9 @@ float read_current ()
 }
 /*===============================================TAREA DE FREERTOS===============================================================*/
 //===============================================CONFIGURA EL SETPOINT===========================================================
-void task_potentiometer(void *pv) {
+void task_potentiometer(void *pv) 
+{
+    dato_t setpoint;
     adc_init();
     adc_gpio_init(POT_PIN); //leo el setpoint
     adc_gpio_init(VOUT_PIN); //leo la tension de salida ADC1
@@ -105,6 +115,7 @@ void task_potentiometer(void *pv) {
             }
             while (!gpio_get(D1))
             {}
+            setpoint.decena = decena;
             printf("Decena: %0.2f\n",decena);
         }
         if(gpio_get(D2) == 0)
@@ -116,14 +127,24 @@ void task_potentiometer(void *pv) {
             }
             while (!gpio_get(D2))
             {}
+            if(10*decena+unidad < 12)
+            {
+                unidad = 2;
+            }
             printf("Unidad: %0.2f\n",unidad);
+            setpoint.unidad = unidad;
         }
         if(gpio_get(D3) == 0)
         {
-            decimal = 5;
+            decimal = decimal + 5;
+            if(decimal > 5)
+            {
+                decimal = 0;
+            }
             while (!gpio_get(D3))
             {}
             printf("Decimañ: %0.2f\n",decimal);
+            setpoint.decimal = decimal;
             
         }
         if(gpio_get(BOTON_OK) == 0)
@@ -132,7 +153,12 @@ void task_potentiometer(void *pv) {
             printf("Valor seteado: %0.2f\n",valor);
             while(gpio_get(BOTON_OK)==0)
             {}
+            setpoint.valor = valor;
+            xQueueSend(queue_set,&setpoint,0);
             xQueueSend(duty_queue, &duty, 0);
+            decena = 0;
+            unidad = 0;
+            decimal = 0;
         }
         last_duty = duty;
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -204,6 +230,7 @@ int main() {
     uint32_t init_level = (uint32_t)((DUTY_MIN / 100.0f) * pwm_wrap);
     pwm_set_chan_level(slice_num, channel, init_level);
     duty_queue = xQueueCreate(2, sizeof(float));
+    queue_set = xQueueCreate(1,sizeof(dato_t));
     xTaskCreate(task_potentiometer, "Pot", 256, NULL, 2, NULL);
     //xTaskCreate(task_pwm_control, "PWM", 256, NULL, 3, NULL);
     //xTaskCreate(task_lcd_display, "LCD", 512, NULL, 1, NULL);
