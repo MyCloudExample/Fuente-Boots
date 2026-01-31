@@ -44,11 +44,14 @@ static uint32_t pwm_wrap;
 static uint slice_num, channel;
 typedef struct
 {
-    float valor;
-    float decena;
-    float unidad;
-    float decimal;
+    float valor;//Valor seteado
+    float decena;//Digito 1
+    float unidad;//Digito 2
+    float decimal;//Digito 3
     uint32_t v_pwm;
+    float porcentaje_pwm;
+    uint8_t hoja;
+    char error;
 }dato_t;
 QueueHandle_t duty_queue;
 QueueHandle_t queue_set;
@@ -64,15 +67,27 @@ float read_potentiometer()
     return duty;
 }
 //===============================================CONVIERTE TENSION (12.0 - 24.0) A NIVEL DE PWM (BASADO EN CICLO 58% - 81%)
-uint32_t calcular_nivel_pwm(float v_deseado) 
+uint32_t calcular_nivel_pwm(float v_deseado, dato_t *aux) 
 {
     // 1. Limitar el valor por seguridad (Clamping)
-    if (v_deseado < 12.0f) v_deseado = 12.0f;
-    if (v_deseado > 24.0f) v_deseado = 24.0f;
+    aux->error = ' ';
+    if (v_deseado < 12.0f)
+    {
+        v_deseado = 12.0f;
+        aux->error = '*';
+    } 
+    if (v_deseado > 24.0f)
+    {
+        v_deseado = 24.0f;
+        aux->error = '*';
+    }
     // 2. Mapeo: 12V -> 58% Duty, 24V -> 81% Duty
     // Fórmula: Duty = Min_D + (V_in - 12) * (Rango_D / Rango_V)
     float duty = DUTY_MIN + (v_deseado - 12.0f) * (DUTY_MAX - DUTY_MIN) / (24.0f - 12.0f);
     // 3. Convertir porcentaje a valor de registro (0 a pwm_wrap)
+    float duty_percent = DUTY_MIN + (v_deseado - 12.0f) * (DUTY_MAX - DUTY_MIN) / (24.0f - 12.0f);
+    aux->porcentaje_pwm = duty_percent;
+    printf("PWM porcetanje:%.2f\n",duty_percent);
     return (uint32_t)((duty / 100.0f) * pwm_wrap);
 }
 //===============================================LECTURA DEL VOLTAJE DE SALIDA POR MEDIO DEL ADC1================================
@@ -95,7 +110,8 @@ float read_current ()
 //===============================================CONFIGURA EL SETPOINT===========================================================
 void task_potentiometer(void *pv) 
 {
-    dato_t setpoint;
+    dato_t setpoint={.hoja=1};
+    dato_t aux;
     adc_init();
     adc_gpio_init(POT_PIN); //leo el setpoint
     adc_gpio_init(VOUT_PIN); //leo la tension de salida ADC1
@@ -122,6 +138,7 @@ void task_potentiometer(void *pv)
         // Enviamos siempre el duty sin umbral para que se actualice
         if(gpio_get(D1) == 0)
         {
+            xQueueReceive(duty_queue,&aux,0); //Borra la cola
             decena = decena + 1;
             if(decena > 2)
             {
@@ -130,10 +147,14 @@ void task_potentiometer(void *pv)
             while (!gpio_get(D1))
             {}
             setpoint.decena = decena;
+            setpoint.valor = 10*decena;
+            setpoint.hoja = 2;
+            xQueueSend(duty_queue,&setpoint,portMAX_DELAY);
             printf("Decena: %0.2f\n",decena);
         }
         if(gpio_get(D2) == 0)
         {
+            xQueueReceive(duty_queue,&aux,0);
             unidad = unidad + 1;
             if(unidad > 9)
             {
@@ -145,11 +166,15 @@ void task_potentiometer(void *pv)
             {
                 unidad = 2;
             }
-            printf("Unidad: %0.2f\n",unidad);
             setpoint.unidad = unidad;
+            setpoint.valor = 10*decena + unidad;
+            setpoint.hoja = 2;
+            xQueueSend(duty_queue,&setpoint,portMAX_DELAY);
+            printf("Unidad: %0.2f\n",unidad);
         }
         if(gpio_get(D3) == 0)
         {
+            xQueueReceive(duty_queue,&aux,0);
             decimal = decimal + 5;
             if(decimal > 5)
             {
@@ -157,26 +182,27 @@ void task_potentiometer(void *pv)
             }
             while (!gpio_get(D3))
             {}
-            printf("Decimañ: %0.2f\n",decimal);
             setpoint.decimal = decimal;
+            setpoint.valor = 10*decena + unidad + (decimal/10);
+            setpoint.hoja = 2;
+            xQueueSend(duty_queue,&setpoint,portMAX_DELAY);
+            printf("Decimañ: %0.2f\n",decimal);
             
         }
         if(gpio_get(BOTON_OK) == 0)
         {
-            float valor = 10*decena + unidad + decimal/10.0f;
-            printf("Valor seteado: %0.2f\n",valor);
+            xQueueReceive(duty_queue,&aux,0);
+            setpoint.valor = 10*decena + unidad + (decimal/10.0f);
+            setpoint.v_pwm = calcular_nivel_pwm(setpoint.valor, &setpoint);
+            setpoint.hoja = 1;
             while(gpio_get(BOTON_OK)==0)
             {}
-            setpoint.valor = valor;
-            setpoint.v_pwm = calcular_nivel_pwm(valor);
             printf("Valor de PWM: %u\n",setpoint.v_pwm);
-            //xQueueSend(queue_set,&setpoint,0);
-            //xQueueSend(duty_queue, &valor, 0);
+            xQueueSend(duty_queue, &setpoint, portMAX_DELAY);
             decena = 0;
             unidad = 0;
             decimal = 0;
         }
-        last_duty = duty;
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
@@ -192,10 +218,12 @@ void task_pwm_control(void *pv) {
     }
 }
 //===============================================VIZUALIZA LOS PARAMETROS CONFIGURADOS===========================================
-void task_lcd_display(void *pv) {
+void task_lcd_display(void *pv) 
+{
     char buffer[21];
-    float duty = DUTY_MIN;
     dato_t setpoint;
+    uint8_t hoja=0;
+    float duty = DUTY_MIN;
     float voltage = 0;
     float valor;
     lcd_init(I2C_PORT, LCD_ADDR);
@@ -205,21 +233,47 @@ void task_lcd_display(void *pv) {
     lcd_set_cursor(2, 0); lcd_string("Vout: 12-24V");
     lcd_set_cursor(3, 0); lcd_string("Iniciando...");
     vTaskDelay(pdMS_TO_TICKS(2000));
-    while (1) {
-        xQueuePeek(duty_queue, &valor, 0);
-        voltage = read_output_voltage();
-        lcd_set_cursor(0, 0);
-        snprintf(buffer, 21, "Duty: %5.1f%%       ", duty);
-        lcd_string(buffer);
-        lcd_set_cursor(1, 0);
-        snprintf(buffer, 21, "Vout: %5.1f V       ", voltage);
-        lcd_string(buffer);
-        lcd_set_cursor(2, 0);
-        snprintf(buffer, 21, "ADC: %4d           ", adc_read());
-        lcd_string(buffer);
-        lcd_set_cursor(3, 0);
-        snprintf(buffer, 21, "PWM: %4u/%4u       ", (uint32_t)((duty/100.0f)*pwm_wrap), pwm_wrap);
-        lcd_string(buffer);
+    lcd_clear();
+    lcd_set_cursor(0,0);
+    lcd_string("Seteo de tension");
+    lcd_set_cursor(1,0);
+    lcd_string("Pulse el Digito 1");
+    lcd_set_cursor(2,0);
+    lcd_string("para iniciar");
+    while (1) 
+    {
+        xQueuePeek(duty_queue, &setpoint, 0);
+        printf("Hoja:%.2f\n",setpoint.hoja);
+        hoja = setpoint.hoja;
+        switch (hoja)
+        {
+        case 1:
+            voltage = read_output_voltage();
+            lcd_set_cursor(0, 0);
+            snprintf(buffer, 21, "Vs:%.2f %c             ", setpoint.valor, setpoint.error);
+            lcd_string(buffer);
+            lcd_set_cursor(1, 0);
+            snprintf(buffer, 21, "Vout: %.2f V            ", voltage);
+            lcd_string(buffer);
+            lcd_set_cursor(2, 0);
+            snprintf(buffer, 21, "PWM%:%u               ", setpoint.v_pwm);
+            lcd_string(buffer);
+            lcd_set_cursor(3, 0);
+            snprintf(buffer, 21, "PWM:%.2f       ",setpoint.porcentaje_pwm);
+            lcd_string(buffer);
+            break;
+        case 2:
+            lcd_set_cursor(0, 0);
+            snprintf(buffer, 21, "Vs:%.2f             ", setpoint.valor);
+            lcd_string(buffer);
+            lcd_set_cursor(1,0);
+            lcd_string("Vs=12V si Vs<12V    ");
+            lcd_set_cursor(2,0);
+            lcd_string("Vs=24V si Vs>24V    ");
+            break;
+        default:
+            break;
+        }
         gpio_xor_mask(1 << LED_PIN);
         vTaskDelay(pdMS_TO_TICKS(500));
     }
@@ -247,7 +301,7 @@ int main() {
     pwm_init(slice_num, &config, true);
     uint32_t init_level = (uint32_t)((DUTY_MIN / 100.0f) * pwm_wrap);
     pwm_set_chan_level(slice_num, channel, init_level);
-    duty_queue = xQueueCreate(2, sizeof(float));
+    duty_queue = xQueueCreate(2, sizeof(dato_t));
     queue_set = xQueueCreate(1,sizeof(dato_t));
     xTaskCreate(task_potentiometer, "Pot", 256, NULL, 2, NULL);
     //xTaskCreate(task_pwm_control, "PWM", 256, NULL, 3, NULL);
