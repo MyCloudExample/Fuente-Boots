@@ -48,13 +48,13 @@ typedef struct
     float decena;//Digito 1
     float unidad;//Digito 2
     float decimal;//Digito 3
-    uint32_t v_pwm;
-    float porcentaje_pwm;
-    uint8_t hoja;
-    char error;
+    uint32_t v_pwm; //Valor del PWM para una tension especificada
+    float porcentaje_pwm; //Valor del PWM expresado en porcentaje
+    uint8_t hoja; //Seleccion de presentacion en pantalla
+    char error; //Indicador visual para indicar seteo fuera de rango (12V-24V)
 }dato_t;
-QueueHandle_t duty_queue;
-QueueHandle_t queue_set;
+QueueHandle_t duty_queue; //Envia datos desde task_configuracion a task_lcd_dispaly
+QueueHandle_t queue_control; //Envia datos desde task_configuracion a task_pwm_control
 /*===============================================FUNCIONES DEL CODIGO============================================================*/
 //===============================================LECTURA DEL ADC0 PARA AJURTAR EL DUTY DEL SETPOINT===============================
 float read_potentiometer() 
@@ -87,7 +87,7 @@ uint32_t calcular_nivel_pwm(float v_deseado, dato_t *aux)
     // 3. Convertir porcentaje a valor de registro (0 a pwm_wrap)
     float duty_percent = DUTY_MIN + (v_deseado - 12.0f) * (DUTY_MAX - DUTY_MIN) / (24.0f - 12.0f);
     aux->porcentaje_pwm = duty_percent;
-    printf("PWM porcetanje:%.2f\n",duty_percent);
+    //printf("PWM porcetanje:%.2f\n",duty_percent);
     return (uint32_t)((duty / 100.0f) * pwm_wrap);
 }
 //===============================================LECTURA DEL VOLTAJE DE SALIDA POR MEDIO DEL ADC1================================
@@ -108,7 +108,7 @@ float read_current ()
 }
 /*===============================================TAREA DE FREERTOS===============================================================*/
 //===============================================CONFIGURA EL SETPOINT===========================================================
-void task_potentiometer(void *pv) 
+void task_configuracion(void *pv) 
 {
     dato_t setpoint={.hoja=1};
     dato_t aux;
@@ -150,7 +150,7 @@ void task_potentiometer(void *pv)
             setpoint.valor = 10*decena;
             setpoint.hoja = 2;
             xQueueSend(duty_queue,&setpoint,portMAX_DELAY);
-            printf("Decena: %0.2f\n",decena);
+            //printf("Decena: %0.2f\n",decena);
         }
         if(gpio_get(D2) == 0)
         {
@@ -170,7 +170,7 @@ void task_potentiometer(void *pv)
             setpoint.valor = 10*decena + unidad;
             setpoint.hoja = 2;
             xQueueSend(duty_queue,&setpoint,portMAX_DELAY);
-            printf("Unidad: %0.2f\n",unidad);
+            //printf("Unidad: %0.2f\n",unidad);
         }
         if(gpio_get(D3) == 0)
         {
@@ -186,7 +186,7 @@ void task_potentiometer(void *pv)
             setpoint.valor = 10*decena + unidad + (decimal/10);
             setpoint.hoja = 2;
             xQueueSend(duty_queue,&setpoint,portMAX_DELAY);
-            printf("Decimañ: %0.2f\n",decimal);
+            //printf("Decimañ: %0.2f\n",decimal);
             
         }
         if(gpio_get(BOTON_OK) == 0)
@@ -197,8 +197,9 @@ void task_potentiometer(void *pv)
             setpoint.hoja = 1;
             while(gpio_get(BOTON_OK)==0)
             {}
-            printf("Valor de PWM: %u\n",setpoint.v_pwm);
+            //printf("Valor de PWM: %u\n",setpoint.v_pwm);
             xQueueSend(duty_queue, &setpoint, portMAX_DELAY);
+            xQueueSend(queue_control,&setpoint,portMAX_DELAY);
             decena = 0;
             unidad = 0;
             decimal = 0;
@@ -207,14 +208,26 @@ void task_potentiometer(void *pv)
     }
 }
 //===============================================ESTABLCE EL VALOR DEL PWM UNA VEZ INDICADO =====================================
-void task_pwm_control(void *pv) {
+void task_pwm_control(void *pv) 
+{
+    dato_t setpoint;
+    uint32_t level;
     float duty = DUTY_MIN;
-    while (1) {
-        if (xQueueReceive(duty_queue, &duty, portMAX_DELAY)) {
+    while (1) 
+    {
+        if (xQueueReceive(queue_control, &setpoint, 0)) 
+        {
+            level = setpoint.v_pwm;
+            pwm_set_chan_level(slice_num, channel, level);
+            printf("task_pwm_control; level:%u",level);
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+        /*else
+        {
             uint32_t level = (uint32_t)((duty / 100.0f) * pwm_wrap);
             printf("Valor del Level: %d\n",level);
             pwm_set_chan_level(slice_num, channel, level);
-        }
+        }*/
     }
 }
 //===============================================VIZUALIZA LOS PARAMETROS CONFIGURADOS===========================================
@@ -243,7 +256,7 @@ void task_lcd_display(void *pv)
     while (1) 
     {
         xQueuePeek(duty_queue, &setpoint, 0);
-        printf("Hoja:%.2f\n",setpoint.hoja);
+        //printf("Hoja:%.2f\n",setpoint.hoja);
         hoja = setpoint.hoja;
         switch (hoja)
         {
@@ -302,9 +315,9 @@ int main() {
     uint32_t init_level = (uint32_t)((DUTY_MIN / 100.0f) * pwm_wrap);
     pwm_set_chan_level(slice_num, channel, init_level);
     duty_queue = xQueueCreate(2, sizeof(dato_t));
-    queue_set = xQueueCreate(1,sizeof(dato_t));
-    xTaskCreate(task_potentiometer, "Pot", 256, NULL, 2, NULL);
-    //xTaskCreate(task_pwm_control, "PWM", 256, NULL, 3, NULL);
+    queue_control = xQueueCreate(1,sizeof(dato_t));
+    xTaskCreate(task_configuracion, "Pot", 256, NULL, 2, NULL);
+    xTaskCreate(task_pwm_control, "PWM", 256, NULL, 3, NULL);
     xTaskCreate(task_lcd_display, "LCD", 512, NULL, 1, NULL);
     vTaskStartScheduler();
     while (1) {
