@@ -91,11 +91,12 @@ uint32_t calcular_nivel_pwm(float v_deseado, dato_t *aux)
     return (uint32_t)((duty / 100.0f) * pwm_wrap);
 }
 //===============================================LECTURA DEL VOLTAJE DE SALIDA POR MEDIO DEL ADC1================================
-float read_output_voltage() {
+float read_output_voltage() 
+{
     adc_select_input(1);
     uint16_t raw = adc_read();
     float v_adc = (raw / 4095.0f) * 3.3f;
-    float v_out = v_adc / DIV_RATIO;
+    float v_out = (v_adc / DIV_RATIO) - 0.20f;
     return v_out;
 }
 //===============================================LECTURA DE CORRIENTE============================================================
