@@ -39,6 +39,12 @@
 #define D1          13
 #define D2          12
 #define D3          11
+//===============================================DEFINICIONES PARA EL CONTROL PID================================================
+/*float Kp = 1.5f; 
+float Ki = 0.05f;
+float Kd = 0.01f;
+float error_acumulado = 0;
+float ultimo_error = 0;*/
 /*===============================================VARIABLES DEL CODIGO============================================================*/
 static uint32_t pwm_wrap;
 static uint slice_num, channel;
@@ -211,24 +217,53 @@ void task_configuracion(void *pv)
 //===============================================ESTABLCE EL VALOR DEL PWM UNA VEZ INDICADO =====================================
 void task_pwm_control(void *pv) 
 {
-    dato_t setpoint;
-    uint32_t level;
-    float duty = DUTY_MIN;
+    dato_t config_recibida;
+    // IMPORTANTE: Inicializar valores por defecto para que no haya basura
+    config_recibida.valor = 0.0f; 
+    config_recibida.porcentaje_pwm = DUTY_MIN;
+
+    float current_duty = DUTY_MIN; 
+    float error_acumulado = 0;
+    const float Kp = 0.15f; 
+    const float Ki = 0.005f; 
+
     while (1) 
     {
-        if (xQueueReceive(queue_control, &setpoint, 0)) 
+        // Intentar recibir datos. Si no hay, no pasa nada, seguimos con los anteriores.
+        xQueueReceive(queue_control, &config_recibida, 0);
+
+        float v_real = read_output_voltage();
+        float v_objetivo = config_recibida.valor;
+
+        // Solo activar el PID si el usuario ya configuró un voltaje válido
+        if (v_objetivo >= 12.0f) 
         {
-            level = setpoint.v_pwm;
+            float error = v_objetivo - v_real;
+            error_acumulado += error;
+            
+            if(error_acumulado > 10.0f) error_acumulado = 10.0f;
+            if(error_acumulado < -10.0f) error_acumulado = -10.0f;
+
+            float ajuste = (Kp * error) + (Ki * error_acumulado);
+            current_duty += ajuste;
+
+            if (current_duty > DUTY_MAX) current_duty = DUTY_MAX;
+            if (current_duty < DUTY_MIN) current_duty = DUTY_MIN;
+
+            uint32_t level = (uint32_t)((current_duty / 100.0f) * pwm_wrap);
             pwm_set_chan_level(slice_num, channel, level);
-            printf("task_pwm_control; level:%u",level);
+            
+            // Actualizamos la global para que el LCD pueda leerla
+            config_recibida.v_pwm = level;
+            config_recibida.porcentaje_pwm = current_duty; 
         }
-        vTaskDelay(pdMS_TO_TICKS(20));
-        /*else
+        else 
         {
-            uint32_t level = (uint32_t)((duty / 100.0f) * pwm_wrap);
-            printf("Valor del Level: %d\n",level);
-            pwm_set_chan_level(slice_num, channel, level);
-        }*/
+            // Si no hay consigna, PWM al mínimo por seguridad
+            pwm_set_chan_level(slice_num, channel, (uint32_t)((DUTY_MIN / 100.0f) * pwm_wrap));
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20)); 
     }
 }
 //===============================================VIZUALIZA LOS PARAMETROS CONFIGURADOS===========================================
@@ -317,9 +352,9 @@ int main() {
     pwm_set_chan_level(slice_num, channel, init_level);
     duty_queue = xQueueCreate(2, sizeof(dato_t));
     queue_control = xQueueCreate(1,sizeof(dato_t));
-    xTaskCreate(task_configuracion, "Pot", 256, NULL, 2, NULL);
-    xTaskCreate(task_pwm_control, "PWM", 256, NULL, 3, NULL);
-    xTaskCreate(task_lcd_display, "LCD", 512, NULL, 1, NULL);
+    xTaskCreate(task_configuracion, "Pot", 512, NULL, 2, NULL);
+    xTaskCreate(task_pwm_control, "PWM", 512, NULL, 2, NULL);
+    xTaskCreate(task_lcd_display, "LCD", 512, NULL, 2, NULL);
     vTaskStartScheduler();
     while (1) {
         gpio_xor_mask(1 << LED_PIN);
