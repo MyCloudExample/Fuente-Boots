@@ -39,6 +39,8 @@
 #define D1          13
 #define D2          12
 #define D3          11
+#define Rsensado    1
+#define GAIN_OPAM   10
 //===============================================DEFINICIONES PARA EL CONTROL PID================================================
 /*float Kp = 1.5f; 
 float Ki = 0.05f;
@@ -111,7 +113,8 @@ float read_current ()
     adc_select_input(2);
     uint16_t raw = adc_read();
     float v_adc = (raw / 4095.0f) * 3.3f;
-    float i = (v_adc)/1000.0f;
+    float i = (v_adc)/(Rsensado * GAIN_OPAM);
+    return i*1000; //Expresado en mA para mejor lectura
 }
 /*===============================================TAREA DE FREERTOS===============================================================*/
 //===============================================CONFIGURA EL SETPOINT===========================================================
@@ -275,6 +278,7 @@ void task_lcd_display(void *pv)
     float duty = DUTY_MIN;
     float voltage = 0;
     float valor;
+    float current;
     lcd_init(I2C_PORT, LCD_ADDR);
     lcd_clear();
     lcd_set_cursor(0, 0); lcd_string("Fuente Boost 36kHz");
@@ -298,6 +302,7 @@ void task_lcd_display(void *pv)
         {
         case 1:
             voltage = read_output_voltage();
+            current = read_current();
             lcd_set_cursor(0, 0);
             snprintf(buffer, 21, "Vs:%.2f %c             ", setpoint.valor, setpoint.error);
             lcd_string(buffer);
@@ -305,7 +310,7 @@ void task_lcd_display(void *pv)
             snprintf(buffer, 21, "Vout: %.2f V            ", voltage);
             lcd_string(buffer);
             lcd_set_cursor(2, 0);
-            snprintf(buffer, 21, "PWM%:%u               ", setpoint.v_pwm);
+            snprintf(buffer, 21, "I:%.3f mA               ", current);
             lcd_string(buffer);
             lcd_set_cursor(3, 0);
             snprintf(buffer, 21, "PWM:%.2f       ",setpoint.porcentaje_pwm);
