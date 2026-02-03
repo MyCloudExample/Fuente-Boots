@@ -61,6 +61,7 @@ typedef struct
     uint8_t hoja; //Seleccion de presentacion en pantalla
     char error; //Indicador visual para indicar seteo fuera de rango (12V-24V)
 }dato_t;
+float corriente_filtrada = 0;
 QueueHandle_t duty_queue; //Envia datos desde task_configuracion a task_lcd_dispaly
 QueueHandle_t queue_control; //Envia datos desde task_configuracion a task_pwm_control
 /*===============================================FUNCIONES DEL CODIGO============================================================*/
@@ -108,13 +109,26 @@ float read_output_voltage()
     return v_out;
 }
 //===============================================LECTURA DE CORRIENTE============================================================
-float read_current ()
+float read_output_current() 
 {
-    adc_select_input(2);
-    uint16_t raw = adc_read();
-    float v_adc = (raw / 4095.0f) * 3.3f;
-    float i = (v_adc)/(Rsensado * GAIN_OPAM);
-    return i*1000; //Expresado en mA para mejor lectura
+    float suma_v = 0;
+    int muestras = 20; // Promediamos 20 lecturas rápidas
+    
+    for(int i = 0; i < muestras; i++) 
+    {
+        adc_select_input(2); 
+        suma_v += (adc_read() * 3.3f) / 4095.0f;
+    }
+    float v_adc = suma_v / muestras;
+
+    // Usamos tu fórmula ajustada que ya funciona:
+    float offset_voltaje = 0.666f; 
+    float corriente_ma = (v_adc - offset_voltaje) * 1350.0f + 60.0f;
+
+    if (corriente_ma < 0) corriente_ma = 0;
+    if (read_output_voltage() < 1.0f) return 0.0f; // Si no hay voltaje, no hay corriente
+
+    return corriente_ma / 1000.0f;
 }
 /*===============================================TAREA DE FREERTOS===============================================================*/
 //===============================================CONFIGURA EL SETPOINT===========================================================
@@ -302,7 +316,8 @@ void task_lcd_display(void *pv)
         {
         case 1:
             voltage = read_output_voltage();
-            current = read_current();
+            current = read_output_current();
+            corriente_filtrada = (corriente_filtrada * 0.9f) + (current * 0.1f);
             lcd_set_cursor(0, 0);
             snprintf(buffer, 21, "Vs:%.2f %c             ", setpoint.valor, setpoint.error);
             lcd_string(buffer);
@@ -310,7 +325,7 @@ void task_lcd_display(void *pv)
             snprintf(buffer, 21, "Vout: %.2f V            ", voltage);
             lcd_string(buffer);
             lcd_set_cursor(2, 0);
-            snprintf(buffer, 21, "I:%.3f mA               ", current);
+            snprintf(buffer, 21, "I:%.3f A               ", current);
             lcd_string(buffer);
             lcd_set_cursor(3, 0);
             snprintf(buffer, 21, "PWM:%.2f       ",setpoint.porcentaje_pwm);
