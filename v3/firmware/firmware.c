@@ -65,6 +65,7 @@ typedef struct
 float corriente_filtrada = 0;
 QueueHandle_t duty_queue; //Envia datos desde task_configuracion a task_lcd_dispaly
 QueueHandle_t queue_control; //Envia datos desde task_configuracion a task_pwm_control
+QueueHandle_t queue_pwm; //Envia datos desde task_pwm_contro a task_lcd_display
 /*===============================================FUNCIONES DEL CODIGO============================================================*/
 //===============================================LECTURA DEL ADC0 PARA AJURTAR EL DUTY DEL SETPOINT===============================
 float read_potentiometer() 
@@ -212,6 +213,7 @@ void task_configuracion(void *pv)
         if(gpio_get(D1) == 0)
         {
             xQueueReceive(duty_queue,&aux,0); //Borra la cola
+            xQueueReceive(queue_control,&aux,0); //Borro la cola
             decena = decena + 1;
             if(decena > 2)
             {
@@ -296,7 +298,7 @@ void task_pwm_control(void *pv)
     while (1) 
     {
         // Intentar recibir datos. Si no hay, no pasa nada, seguimos con los anteriores.
-        xQueueReceive(queue_control, &config_recibida, 0);
+        xQueuePeek(queue_control, &config_recibida, portMAX_DELAY);
 
         float v_real = read_output_voltage();
         float v_objetivo = config_recibida.valor;
@@ -322,6 +324,7 @@ void task_pwm_control(void *pv)
             // Actualizamos la global para que el LCD pueda leerla
             config_recibida.v_pwm = level;
             config_recibida.porcentaje_pwm = current_duty; 
+            xQueueOverwrite(queue_pwm,&config_recibida);
         }
         else 
         {
@@ -336,7 +339,7 @@ void task_pwm_control(void *pv)
 void task_lcd_display(void *pv) 
 {
     char buffer[21];
-    dato_t setpoint;
+    dato_t setpoint, pwm_control;
     uint8_t hoja=0;
     float duty = DUTY_MIN;
     float voltage = 0;
@@ -359,6 +362,7 @@ void task_lcd_display(void *pv)
     while (1) 
     {
         xQueuePeek(duty_queue, &setpoint, 0);
+        xQueuePeek(queue_pwm,&pwm_control,0);
         //printf("Hoja:%.2f\n",setpoint.hoja);
         hoja = setpoint.hoja;
         switch (hoja)
@@ -377,7 +381,7 @@ void task_lcd_display(void *pv)
             snprintf(buffer, 21, "I:%.3f A               ", current);
             lcd_string(buffer);
             lcd_set_cursor(3, 0);
-            snprintf(buffer, 21, "PWM:%.2f       ",setpoint.porcentaje_pwm);
+            snprintf(buffer, 21, "PWM:%.2f       ",pwm_control.porcentaje_pwm);
             lcd_string(buffer);
             break;
         case 2:
@@ -388,6 +392,8 @@ void task_lcd_display(void *pv)
             lcd_string("Vs=12V si Vs<12V    ");
             lcd_set_cursor(2,0);
             lcd_string("Vs=24V si Vs>24V    ");
+            lcd_set_cursor(3,0);
+            lcd_string("                 ");
             break;
         default:
             break;
@@ -424,8 +430,9 @@ int main() {
     pwm_set_chan_level(slice_num, channel, init_level);
     duty_queue = xQueueCreate(2, sizeof(dato_t));
     queue_control = xQueueCreate(1,sizeof(dato_t));
-    xTaskCreate(task_configuracion, "Pot", 512, NULL, 2, NULL);
-    xTaskCreate(task_pwm_control, "PWM", 512, NULL, 2, NULL);
+    queue_pwm = xQueueCreate(1, sizeof(dato_t));
+    xTaskCreate(task_configuracion, "SETEO", 512, NULL, 2, NULL);
+    xTaskCreate(task_pwm_control, "PWM", 512, NULL, 3, NULL);
     xTaskCreate(task_lcd_display, "LCD", 512, NULL, 2, NULL);
     //xTaskCreate(task_uart_control, "UART", 512, NULL, 2, NULL);
     vTaskStartScheduler();
