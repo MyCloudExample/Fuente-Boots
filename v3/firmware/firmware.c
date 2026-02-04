@@ -65,6 +65,7 @@ typedef struct
 float corriente_filtrada = 0;
 QueueHandle_t duty_queue; //Envia datos desde task_configuracion a task_lcd_dispaly
 QueueHandle_t queue_control; //Envia datos desde task_configuracion a task_pwm_control
+QueueHandle_t queue_pwm; //Envia datos desde task_pwm_contro a task_lcd_display
 /*===============================================FUNCIONES DEL CODIGO============================================================*/
 //===============================================LECTURA DEL ADC0 PARA AJURTAR EL DUTY DEL SETPOINT===============================
 float read_potentiometer() 
@@ -323,7 +324,7 @@ void task_pwm_control(void *pv)
             // Actualizamos la global para que el LCD pueda leerla
             config_recibida.v_pwm = level;
             config_recibida.porcentaje_pwm = current_duty; 
-            xQueueOverwrite(duty_queue,&config_recibida);
+            xQueueOverwrite(queue_pwm,&config_recibida);
         }
         else 
         {
@@ -361,7 +362,7 @@ void task_lcd_display(void *pv)
     while (1) 
     {
         xQueuePeek(duty_queue, &setpoint, 0);
-        xQueueReceive(duty_queue,&pwm_control,0);
+        xQueuePeek(queue_pwm,&pwm_control,0);
         //printf("Hoja:%.2f\n",setpoint.hoja);
         hoja = setpoint.hoja;
         switch (hoja)
@@ -429,6 +430,7 @@ int main() {
     pwm_set_chan_level(slice_num, channel, init_level);
     duty_queue = xQueueCreate(2, sizeof(dato_t));
     queue_control = xQueueCreate(1,sizeof(dato_t));
+    queue_pwm = xQueueCreate(1, sizeof(dato_t));
     xTaskCreate(task_configuracion, "SETEO", 512, NULL, 2, NULL);
     xTaskCreate(task_pwm_control, "PWM", 512, NULL, 3, NULL);
     xTaskCreate(task_lcd_display, "LCD", 512, NULL, 2, NULL);
