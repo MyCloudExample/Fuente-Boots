@@ -41,12 +41,13 @@
 #define D3          11
 #define Rsensado    1
 #define GAIN_OPAM   10
-//===============================================DEFINICIONES PARA EL CONTROL PID================================================
-/*float Kp = 1.5f; 
-float Ki = 0.05f;
-float Kd = 0.01f;
-float error_acumulado = 0;
-float ultimo_error = 0;*/
+//===============================================CONFIGURACION DEL UART0
+#define TX_UART_0   0
+#define RX_UART_0   1
+#define BAUD_RATE   115200
+#define ID_UART     uart0 
+//===============================================CONFIGURACION UART0==============================================================
+
 /*===============================================VARIABLES DEL CODIGO============================================================*/
 static uint32_t pwm_wrap;
 static uint slice_num, channel;
@@ -131,6 +132,54 @@ float read_output_current()
     return corriente_ma / 1000.0f;
 }
 /*===============================================TAREA DE FREERTOS===============================================================*/
+//===============================================CONFIGURA EL SETPOINR POR UART==================================================
+void task_uart_control(void *pv) 
+{
+    char buffer[32];
+    int idx = 0;
+    dato_t comando_uart;
+
+    while (1) {
+        if (uart_is_readable(ID_UART)) 
+        {
+            char c = uart_getc(ID_UART);
+            
+            // Si no es fin de línea, guardar en buffer
+            if (c != '\n' && c != '\r' && idx < 31) 
+            {
+                buffer[idx++] = c;
+            } 
+            else if (idx > 0) 
+            {
+                buffer[idx] = '\0'; // Terminar string
+                float nuevo_setpoint = atof(buffer); // Convertir texto a float
+                idx = 0; // Reiniciar buffer
+
+                // Validar rango de seguridad
+                if (nuevo_setpoint >= 12.0f && nuevo_setpoint <= 24.0f) 
+                {
+                    comando_uart.valor = nuevo_setpoint;
+                    calcular_nivel_pwm(comando_uart.valor, &comando_uart);
+                    comando_uart.hoja = 1; //No muestro mientras configuro el seteo
+                    comando_uart.porcentaje_pwm = 70.0f; // Valor inicial aproximado
+                    printf("Valor recibido por UART: %.2f\n",comando_uart.valor);
+                    // Enviar a la cola existente
+                    xQueueOverwrite(duty_queue, &comando_uart);
+                    xQueueOverwrite(queue_control, &comando_uart);
+                    
+                    uart_puts(ID_UART, "OK: Setpoint actualizado\n");
+                } 
+                else 
+                {
+                    uart_puts(ID_UART, "Error: Valor fuera de rango (12-24V)\n");
+                    printf("No hay datos\n");
+                }
+            }
+        }
+        printf("No hay datos\n");
+        vTaskDelay(pdMS_TO_TICKS(50)); // No saturar la CPU
+    }
+}
 //===============================================CONFIGURA EL SETPOINT===========================================================
 void task_configuracion(void *pv) 
 {
@@ -351,6 +400,9 @@ void task_lcd_display(void *pv)
 int main() {
     stdio_init_all();
     sleep_ms(1500);
+    uart_init(ID_UART, BAUD_RATE);
+    gpio_set_function(TX_UART_0, GPIO_FUNC_UART);
+    gpio_set_function(RX_UART_0, GPIO_FUNC_UART);
     i2c_init(I2C_PORT, 100000);
     gpio_set_function(I2C_SDA, GPIO_FUNC_I2C);
     gpio_set_function(I2C_SCL, GPIO_FUNC_I2C);
@@ -375,6 +427,7 @@ int main() {
     xTaskCreate(task_configuracion, "Pot", 512, NULL, 2, NULL);
     xTaskCreate(task_pwm_control, "PWM", 512, NULL, 2, NULL);
     xTaskCreate(task_lcd_display, "LCD", 512, NULL, 2, NULL);
+    //xTaskCreate(task_uart_control, "UART", 512, NULL, 2, NULL);
     vTaskStartScheduler();
     while (1) {
         gpio_xor_mask(1 << LED_PIN);
