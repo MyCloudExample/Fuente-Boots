@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>Control Fuente Boost</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <style>
+        .display-value { font-size: 2.5rem; font-weight: bold; color: #0d6efd; }
+        .card { box-shadow: 0 4px 8px rgba(0,0,0,0.1); }
+    </style>
+</head>
+<body class="bg-light">
+    <div class="container py-5">
+        <h1 class="text-center mb-4">Panel de Control - Fuente Boost</h1>
+        
+        <div class="row g-4">
+            <div class="col-md-6">
+                <div class="card h-100">
+                    <div class="card-body">
+                        <h5 class="card-title">Configurar Tensión (12V - 24V)</h5>
+                        <input type="range" class="form-range" min="12" max="24" step="0.1" value="12" id="voltageSlider" oninput="updateLabel(this.value)">
+                        <div class="text-center mt-3">
+                            <span id="targetLabel" class="h3">0.0</span> <span class="h3">V</span>
+                        </div>
+                        <button class="btn btn-primary w-100 mt-3" onclick="sendVoltage()">Establecer Voltaje</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="col-md-6">
+                <div class="card h-100 text-center">
+                    <div class="card-body">
+                        <h5 class="card-title">Mediciones de Salida</h5>
+                        <div class="row">
+                            <div class="col-6">
+                                <p class="text-muted mb-0">Tensión</p>
+                                <div id="v_out" class="display-value">0.00 V</div>
+                            </div>
+                            <div class="col-6">
+                                <p class="text-muted mb-0">Corriente</p>
+                                <div id="i_out" class="display-value" style="color: #dc3545;">0.00 A</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const socket = io();
+
+        function updateLabel(val) {
+            document.getElementById('targetLabel').innerText = val;
+        }
+
+        function sendVoltage() {
+            const val = document.getElementById('voltageSlider').value;
+            socket.emit('set_voltage', {value: val});
+        }
+
+        // Recibir actualizaciones de la Pi 4
+        socket.on('update_metrics', function(data) {
+            document.getElementById('v_out').innerText = data.voltage + " V";
+            document.getElementById('i_out').innerText = data.current + " A";
+        });
+    </script>
+</body>
+</html>
