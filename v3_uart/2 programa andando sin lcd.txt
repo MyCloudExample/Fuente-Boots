@@ -1,0 +1,192 @@
+#include "pico/stdlib.h"
+#include "hardware/pwm.h"
+#include "hardware/adc.h"
+
+#include <stdio.h>
+#include <stdlib.h> 
+
+#include "FreeRTOS.h"
+#include "task.h"
+#include "queue.h"
+
+/* --------------------------------------------------------
+   DEFINICIONES
+   --------------------------------------------------------*/
+#define PWM_PIN     22     // PWM en GP22
+#define POT_ADC     26     // ADC0 = GP26
+#define LED_PIN     25     // LED interno para debug
+#define PWM_FREQ    30000  // 30 kHz exactos
+
+// LÍMITES DEL DUTY CYCLE
+#define DUTY_MIN    58.0f  // Mínimo 58%
+#define DUTY_MAX    80.0f  // Máximo 80%
+
+// CALIBRACIÓN PARA 30 kHz
+#define CLOCK_SYS_HZ     125000000  // 125 MHz
+#define CLOCK_DIV        1.25f      // Probamos este divisor
+
+// Cola para enviar duty del ADC → PWM
+QueueHandle_t xDutyQueue;
+
+/* Variables globales del PWM */
+static uint32_t g_pwm_wrap = 0;
+static uint32_t g_pwm_slice = 0;
+static uint32_t g_pwm_chan  = 0;
+
+/* --------------------------------------------------------
+   INICIALIZACIÓN PWM
+   --------------------------------------------------------*/
+void init_pwm_30khz(void)
+{
+    gpio_set_function(PWM_PIN, GPIO_FUNC_PWM);
+    gpio_init(LED_PIN);
+    gpio_set_dir(LED_PIN, GPIO_OUT);
+    gpio_put(LED_PIN, 1);  // LED ON al inicio
+
+    g_pwm_slice = pwm_gpio_to_slice_num(PWM_PIN);
+    g_pwm_chan  = pwm_gpio_to_channel(PWM_PIN);
+
+    // Calcular wrap
+    g_pwm_wrap = (uint32_t)((CLOCK_SYS_HZ / (PWM_FREQ * CLOCK_DIV)) - 1);
+
+    pwm_set_clkdiv(g_pwm_slice, CLOCK_DIV);
+    pwm_set_wrap(g_pwm_slice, g_pwm_wrap);
+    
+    // Iniciar en 58%
+    uint32_t initial_level = (uint32_t)((DUTY_MIN / 100.0f) * g_pwm_wrap);
+    pwm_set_chan_level(g_pwm_slice, g_pwm_chan, initial_level);
+
+    pwm_set_enabled(g_pwm_slice, true);
+}
+
+/* --------------------------------------------------------
+   TASK: ADC — Lee potenciómetro
+   --------------------------------------------------------*/
+void Task_ADC(void *p)
+{
+    adc_init();
+    adc_gpio_init(POT_ADC);
+    adc_select_input(0);
+
+    const TickType_t delay = pdMS_TO_TICKS(10);  // 10ms (rápido)
+    uint16_t adc_min = 4095;
+    uint16_t adc_max = 0;
+    uint8_t calibration_done = 0;
+    uint32_t counter = 0;
+
+    while (1)
+    {
+        uint16_t raw = adc_read();
+        
+        // Calibración automática (1 segundo)
+        if (!calibration_done) {
+            if (raw < adc_min && raw > 10) adc_min = raw;
+            if (raw > adc_max && raw < 4085) adc_max = raw;
+            
+            if (counter++ > 100) {  // ~1 segundo
+                calibration_done = 1;
+                gpio_put(LED_PIN, 0);  // LED OFF = calibración lista
+                
+                // Si calibración mala, usar valores por defecto
+                if ((adc_max - adc_min) < 500) {
+                    adc_min = 100;
+                    adc_max = 3900;
+                }
+            }
+            vTaskDelay(delay);
+            continue;
+        }
+        
+        // Mapeo usando rango calibrado
+        float normalized;
+        if (adc_max == adc_min) {
+            normalized = 0.5f;
+        } else {
+            normalized = (float)(raw - adc_min) / (float)(adc_max - adc_min);
+            if (normalized < 0.0f) normalized = 0.0f;
+            if (normalized > 1.0f) normalized = 1.0f;
+        }
+        
+        // Aplicar todo el rango 58-80%
+        float duty_pct = DUTY_MIN + normalized * (DUTY_MAX - DUTY_MIN);
+        
+        // Limitar
+        if (duty_pct < DUTY_MIN) duty_pct = DUTY_MIN;
+        if (duty_pct > DUTY_MAX) duty_pct = DUTY_MAX;
+        
+        // Enviar
+        xQueueSend(xDutyQueue, &duty_pct, 0);
+
+        // LED parpadea rápido cuando hay actividad
+        static uint8_t blink = 0;
+        if (++blink > 5) {
+            gpio_xor_mask(1u << LED_PIN);
+            blink = 0;
+        }
+
+        vTaskDelay(delay);
+    }
+}
+
+/* --------------------------------------------------------
+   TASK: PWM — Actualiza el PWM
+   --------------------------------------------------------*/
+void Task_PWM(void *p)
+{
+    float duty_pct;
+    float current_duty = DUTY_MIN;
+
+    while (1)
+    {
+        if (xQueueReceive(xDutyQueue, &duty_pct, portMAX_DELAY))
+        {
+            // Suavizado ligero
+            current_duty = (current_duty * 0.7f) + (duty_pct * 0.3f);
+            
+            // Limitar
+            if (current_duty < DUTY_MIN) current_duty = DUTY_MIN;
+            if (current_duty > DUTY_MAX) current_duty = DUTY_MAX;
+            
+            // Calcular y aplicar
+            uint32_t level = (uint32_t)((current_duty / 100.0f) * (float)g_pwm_wrap);
+            if (level > g_pwm_wrap) level = g_pwm_wrap;
+            
+            pwm_set_chan_level(g_pwm_slice, g_pwm_chan, level);
+        }
+    }
+}
+
+/* --------------------------------------------------------
+   TASK: TEST — Prueba de frecuencia
+   --------------------------------------------------------*/
+void Task_Test(void *p)
+{
+    const TickType_t delay = pdMS_TO_TICKS(1000);
+    
+    while (1)
+    {
+        // Parpadeo lento = sistema funcionando
+        gpio_xor_mask(1u << LED_PIN);
+        vTaskDelay(delay);
+    }
+}
+
+/* --------------------------------------------------------
+   MAIN
+   --------------------------------------------------------*/
+int main()
+{
+    // Inicializar sin serial
+    // stdio_init_all(); // COMENTADO
+    
+    init_pwm_30khz();
+    xDutyQueue = xQueueCreate(4, sizeof(float));
+
+    xTaskCreate(Task_ADC,   "ADC",  512, NULL, 2, NULL);
+    xTaskCreate(Task_PWM,   "PWM",  512, NULL, 3, NULL);
+    xTaskCreate(Task_Test,  "Test", 256, NULL, 1, NULL);
+
+    vTaskStartScheduler();
+
+    while (1) {}
+}
