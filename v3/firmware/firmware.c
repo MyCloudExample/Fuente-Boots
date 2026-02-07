@@ -294,7 +294,8 @@ void task_pwm_control(void *pv)
     float error_acumulado = 0;
     const float Kp = 0.15f; 
     const float Ki = 0.005f;
-    const float Kd = 0; 
+    const float Kd = 0;
+     
 
     while (1) 
     {
