@@ -21,6 +21,7 @@
 #define PWM_PIN     22
 #define POT_PIN     26
 #define VOUT_PIN    27
+#define IOUT_PIN    28
 #define LED_PIN     25
 #define PWM_FREQ    30000
 //===============================================DEFINICIONES PARA EL I2C
@@ -132,53 +133,62 @@ float read_output_current()
 
     return corriente_ma / 1000.0f;
 }
+//===============================================TELEMETRIA DE DATOS DE SALIDA===================================================
+void telemetria_uart_out(float v_out)
+{
+    float i_real = 0;
+    char buffer[21];
+
+    i_real = read_output_current(); // Leemos la corriente actual        
+    snprintf(buffer,sizeof(buffer),"V:%.2f,I:%.2f\n",v_out, i_real);
+    uart_puts(ID_UART, buffer);
+    // El formato debe ser exacto para que el script de Python lo entienda: "V:XX.XX,I:X.XX\n"
+    //printf("V:%.2f,I:%.2f\n", v_out, i_real);
+    //NOTA: usar cat /dev/serial0 en la Raspberry Pi 4 para despertar el puernto serie
+    uart_tx_wait_blocking(ID_UART);
+
+}
 /*===============================================TAREA DE FREERTOS===============================================================*/
 //===============================================CONFIGURA EL SETPOINR POR UART==================================================
-void task_uart_control(void *pv) 
-{
+void task_uart_control(void *pvParameters) {
     char buffer[32];
     int idx = 0;
-    dato_t comando_uart;
+    float v_target;
+    dato_t setpoint={.valor=12.0f, .porcentaje_pwm=DUTY_MIN, .hoja=1};
 
-    while (1) {
-        if (uart_is_readable(ID_UART)) 
+    xQueueOverwrite(queue_control, &setpoint); //Si no se reciben datos por uart se envia siemre el mismo valor al LCD
+    xQueueOverwrite(duty_queue, &setpoint); //Ingreso por primera vez envia dato preconfigurado, luego el envia continaumoente el dato configurado
+
+    while (1) 
+    {
+       
+        while (uart_is_readable(ID_UART)) 
         {
+            //xQueueReceive(duty_queue,&aux,pdMS_TO_TICKS(0));
             char c = uart_getc(ID_UART);
-            
-            // Si no es fin de línea, guardar en buffer
-            if (c != '\n' && c != '\r' && idx < 31) 
+            //Completada la trasnferencia del dato sverifico si es un parametro correcto
+            if (c == '\n' || idx >= 31) 
+            {
+                buffer[idx] = '\0';
+                
+                if (buffer[0] == 'S') 
+                {
+                    v_target = atof(buffer + 1); //Convierto dato a tipo float
+                    printf(">>> WEB -> RPi4 -> PICO: Nuevo Setpoint recibido: %.2fV\n", v_target);
+                    setpoint.valor = v_target; //CArgo el valor de seteo
+                    setpoint.hoja = 1;
+                    setpoint.v_pwm = calcular_nivel_pwm(v_target, &setpoint); //Obtengo el valor del PWM en porcentaje
+                    xQueueOverwrite(queue_control,&setpoint); //Dato para task_lcd_display
+                    xQueueOverwrite(duty_queue,&setpoint); //Dato para task_pwm_control
+                }
+                idx = 0;
+            } 
+            else 
             {
                 buffer[idx++] = c;
-            } 
-            else if (idx > 0) 
-            {
-                buffer[idx] = '\0'; // Terminar string
-                float nuevo_setpoint = atof(buffer); // Convertir texto a float
-                idx = 0; // Reiniciar buffer
-
-                // Validar rango de seguridad
-                if (nuevo_setpoint >= 12.0f && nuevo_setpoint <= 24.0f) 
-                {
-                    comando_uart.valor = nuevo_setpoint;
-                    calcular_nivel_pwm(comando_uart.valor, &comando_uart);
-                    comando_uart.hoja = 1; //No muestro mientras configuro el seteo
-                    comando_uart.porcentaje_pwm = 70.0f; // Valor inicial aproximado
-                    printf("Valor recibido por UART: %.2f\n",comando_uart.valor);
-                    // Enviar a la cola existente
-                    xQueueOverwrite(duty_queue, &comando_uart);
-                    xQueueOverwrite(queue_control, &comando_uart);
-                    
-                    uart_puts(ID_UART, "OK: Setpoint actualizado\n");
-                } 
-                else 
-                {
-                    uart_puts(ID_UART, "Error: Valor fuera de rango (12-24V)\n");
-                    printf("No hay datos\n");
-                }
             }
         }
-        printf("No hay datos\n");
-        vTaskDelay(pdMS_TO_TICKS(50)); // No saturar la CPU
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 //===============================================CONFIGURA EL SETPOINT===========================================================
@@ -289,25 +299,33 @@ void task_pwm_control(void *pv)
     // IMPORTANTE: Inicializar valores por defecto para que no haya basura
     config_recibida.valor = 0.0f; 
     config_recibida.porcentaje_pwm = DUTY_MIN;
-
     float current_duty = DUTY_MIN; 
     float error_acumulado = 0;
     const float Kp = 0.15f; 
     const float Ki = 0.005f;
     const float Kd = 0;
-     
+    float v_objetivo = 0; //Alamcena el valor de seteo
+    float v_real = 0; //Para almaceanr la medicon de tension de salida
+    static int contador_red=0; //Usado para enviar datos cada 200 mseg
 
     while (1) 
     {
         // Intentar recibir datos. Si no hay, no pasa nada, seguimos con los anteriores.
-        xQueuePeek(queue_control, &config_recibida, portMAX_DELAY);
-
-        float v_real = read_output_voltage();
-        float v_objetivo = config_recibida.valor;
-
+        if(xQueueReceive(queue_control, &config_recibida, pdMS_TO_TICKS(0)) == pdPASS)
+        {
+            printf("Se recibio dato nuevo\n");
+            // Si el setpoint cambia drásticamente se reseta  la parte integral
+            if(fabs(v_objetivo - config_recibida.valor) > 0.5f) 
+            {
+                error_acumulado = 0;
+            }
+            v_objetivo = config_recibida.valor;
+        }
+        v_real = read_output_voltage();
         // Solo activar el PID si el usuario ya configuró un voltaje válido
         if (v_objetivo >= 12.0f) 
         {
+            printf("Dato valido\n");
             float error = v_objetivo - v_real;
             error_acumulado += error;
             
@@ -333,7 +351,12 @@ void task_pwm_control(void *pv)
             // Si no hay consigna, PWM al mínimo por seguridad
             pwm_set_chan_level(slice_num, channel, (uint32_t)((DUTY_MIN / 100.0f) * pwm_wrap));
         }
-
+        contador_red++;
+        if(contador_red == 10)
+        {
+            contador_red = 0;
+            telemetria_uart_out(v_real);
+        }
         vTaskDelay(pdMS_TO_TICKS(20)); 
     }
 }
@@ -358,9 +381,9 @@ void task_lcd_display(void *pv)
     lcd_set_cursor(0,0);
     lcd_string("Seteo de tension");
     lcd_set_cursor(1,0);
-    lcd_string("Pulse el Digito 1");
-    lcd_set_cursor(2,0);
-    lcd_string("para iniciar");
+    lcd_string("Seteo por UART");
+    lcd_set_cursor(0,0);
+    lcd_string("                             ");
     while (1) 
     {
         xQueuePeek(duty_queue, &setpoint, 0);
@@ -374,7 +397,7 @@ void task_lcd_display(void *pv)
             current = read_output_current();
             corriente_filtrada = (corriente_filtrada * 0.9f) + (current * 0.1f);
             lcd_set_cursor(0, 0);
-            snprintf(buffer, 21, "Vs:%.2f %c             ", setpoint.valor, setpoint.error);
+            snprintf(buffer, 21, "Vs:%.2f %c                    ", setpoint.valor, setpoint.error);
             lcd_string(buffer);
             lcd_set_cursor(1, 0);
             snprintf(buffer, 21, "Vout: %.2f V            ", voltage);
@@ -405,20 +428,25 @@ void task_lcd_display(void *pv)
     }
 }
 
-int main() {
+int main() 
+{
     stdio_init_all();
     sleep_ms(1500);
+    //Inicializo el UART0
     uart_init(ID_UART, BAUD_RATE);
     gpio_set_function(TX_UART_0, GPIO_FUNC_UART);
     gpio_set_function(RX_UART_0, GPIO_FUNC_UART);
+    //Inicializo el I2C0
     i2c_init(I2C_PORT, 100000);
     gpio_set_function(I2C_SDA, GPIO_FUNC_I2C);
     gpio_set_function(I2C_SCL, GPIO_FUNC_I2C);
     gpio_pull_up(I2C_SDA);
     gpio_pull_up(I2C_SCL);
+    //Inicializo el led de la pico
     gpio_init(LED_PIN);
     gpio_set_dir(LED_PIN, GPIO_OUT);
     gpio_put(LED_PIN, 1);
+    //Inicializo el PWM
     gpio_set_function(PWM_PIN, GPIO_FUNC_PWM);
     slice_num = pwm_gpio_to_slice_num(PWM_PIN);
     channel = pwm_gpio_to_channel(PWM_PIN);
@@ -430,13 +458,19 @@ int main() {
     pwm_init(slice_num, &config, true);
     uint32_t init_level = (uint32_t)((DUTY_MIN / 100.0f) * pwm_wrap);
     pwm_set_chan_level(slice_num, channel, init_level);
+    //Inicializo ADCs
+    adc_init();
+    adc_gpio_init(VOUT_PIN); //Activo el ADC para medir tension de salida
+    adc_gpio_init(IOUT_PIN); //Activo el ADC para medir corriente de salida
+    adc_gpio_init(POT_PIN); //Activo el ADC para medir el seteo, dejado para pruebas
+    //Creacion de colas
     duty_queue = xQueueCreate(2, sizeof(dato_t));
     queue_control = xQueueCreate(1,sizeof(dato_t));
     queue_pwm = xQueueCreate(1, sizeof(dato_t));
-    xTaskCreate(task_configuracion, "SETEO", 512, NULL, 2, NULL);
+    //xTaskCreate(task_configuracion, "SETEO", 512, NULL, 2, NULL);
     xTaskCreate(task_pwm_control, "PWM", 512, NULL, 3, NULL);
     xTaskCreate(task_lcd_display, "LCD", 512, NULL, 2, NULL);
-    //xTaskCreate(task_uart_control, "UART", 512, NULL, 2, NULL);
+    xTaskCreate(task_uart_control, "UART", 512, NULL, 2, NULL);
     vTaskStartScheduler();
     while (1) {
         gpio_xor_mask(1 << LED_PIN);
