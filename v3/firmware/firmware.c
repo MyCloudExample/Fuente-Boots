@@ -21,6 +21,7 @@
 #define PWM_PIN     22
 #define POT_PIN     26
 #define VOUT_PIN    27
+#define IOUT_PIN    28
 #define LED_PIN     25
 #define PWM_FREQ    30000
 //===============================================DEFINICIONES PARA EL I2C
@@ -186,25 +187,11 @@ void task_configuracion(void *pv)
 {
     dato_t setpoint={.hoja=1};
     dato_t aux;
-    adc_init();
-    adc_gpio_init(POT_PIN); //leo el setpoint
-    adc_gpio_init(VOUT_PIN); //leo la tension de salida ADC1
-    //Configuro el boton de ok
-    gpio_init(BOTON_OK);
-    gpio_set_dir(BOTON_OK,false);
-    //Configuro el boton para el digito 1
-    gpio_init(D1);
-    gpio_set_dir(D1,false);
     float decena = 0;
-    //Configuro el boton para el digito 2
-    gpio_init(D2);
-    gpio_set_dir(D2,false);
     float unidad = 0;
-    //Configuro el boton para el digito 3, decimal
-    gpio_init(D3);
-    gpio_set_dir(D3,false);
     float decimal = 0;
     float last_duty = DUTY_MIN;
+
     while (1) 
     {
         float duty = read_potentiometer();
@@ -250,8 +237,8 @@ void task_configuracion(void *pv)
         if(gpio_get(D3) == 0)
         {
             xQueueReceive(duty_queue,&aux,0);
-            decimal = decimal + 5;
-            if(decimal > 5)
+            decimal = decimal + 1;
+            if(decimal > 9)
             {
                 decimal = 0;
             }
@@ -405,20 +392,25 @@ void task_lcd_display(void *pv)
     }
 }
 
-int main() {
+int main() 
+{
     stdio_init_all();
     sleep_ms(1500);
+    //Configuracion de UART0
     uart_init(ID_UART, BAUD_RATE);
     gpio_set_function(TX_UART_0, GPIO_FUNC_UART);
     gpio_set_function(RX_UART_0, GPIO_FUNC_UART);
+    //Configuracion de I2C0
     i2c_init(I2C_PORT, 100000);
     gpio_set_function(I2C_SDA, GPIO_FUNC_I2C);
     gpio_set_function(I2C_SCL, GPIO_FUNC_I2C);
     gpio_pull_up(I2C_SDA);
     gpio_pull_up(I2C_SCL);
+    //Configuracion de LED de actividad
     gpio_init(LED_PIN);
     gpio_set_dir(LED_PIN, GPIO_OUT);
     gpio_put(LED_PIN, 1);
+    //Configuracion de PWM
     gpio_set_function(PWM_PIN, GPIO_FUNC_PWM);
     slice_num = pwm_gpio_to_slice_num(PWM_PIN);
     channel = pwm_gpio_to_channel(PWM_PIN);
@@ -430,6 +422,24 @@ int main() {
     pwm_init(slice_num, &config, true);
     uint32_t init_level = (uint32_t)((DUTY_MIN / 100.0f) * pwm_wrap);
     pwm_set_chan_level(slice_num, channel, init_level);
+    //Configuracion del ADCs
+    adc_init();
+    adc_gpio_init(POT_PIN); //leo el setpoint
+    adc_gpio_init(VOUT_PIN); //leo la tension de salida ADC1
+    adc_gpio_init(IOUT_PIN); //leo la corriente de salida 
+    //Configuro el boton de ok
+    gpio_init(BOTON_OK);
+    gpio_set_dir(BOTON_OK,false);
+    //Configuro el boton para el digito 1
+    gpio_init(D1);
+    gpio_set_dir(D1,false);
+    //Configuro el boton para el digito 2
+    gpio_init(D2);
+    gpio_set_dir(D2,false);
+    //Configuro el boton para el digito 3, decimal
+    gpio_init(D3);
+    gpio_set_dir(D3,false);
+    //Creacion de colas
     duty_queue = xQueueCreate(2, sizeof(dato_t));
     queue_control = xQueueCreate(1,sizeof(dato_t));
     queue_pwm = xQueueCreate(1, sizeof(dato_t));
