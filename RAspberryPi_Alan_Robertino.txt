@@ -1,0 +1,6 @@
+Nombre del equipo (host): alan
+Nombre de usuario: Wilson
+Contraseña: 1234567
+Direccion Web: http://alan.local:5000
+En la raspberry para conexion ssh usar:
+-ssh wilson@alan.local (para windows)
