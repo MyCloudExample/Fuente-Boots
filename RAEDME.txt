@@ -1,0 +1,15 @@
+1- GUI
+    ESta carpeta contiene un primer intento de interfaz grafica local y de web
+2- SERDEV_EGB
+    Esta carpeta contiene el driver creado con serdev funcional
+    -serdev: contiene el driver y el overlay, tambien se incluye la pagina web, un script en Python que envia el seteo y recibe las mediciones
+    -Web: contiene un apgianweb pero sin contar con el driver serdev, se usa con los driver comunes de la Pi (app1.py)
+    -fuente-boots.py es una interfaz grafica local, no se peuda usar por consola sin un entorno grafico
+3- v3
+    Es el codigo de la EGA funcional
+4- v3_uart
+    Es el codigo de la EGB con comunicacion UART funcional
+5- RAspberryPi_Alan_Robertino
+    Son los datos de la Pi usuario, hotsname, contraseña y direccion de la pagina web
+            
+

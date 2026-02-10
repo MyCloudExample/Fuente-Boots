@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Control EGB - Pico</title>
+    <style>
+        body { font-family: sans-serif; background: #1a1a1a; color: #eee; text-align: center; }
+        .panel { border: 2px solid #3498db; padding: 20px; display: inline-block; border-radius: 10px; margin-top: 50px; }
+        input { padding: 10px; border-radius: 5px; border: none; width: 80px; font-size: 1.2em; }
+        button { padding: 10px 20px; background: #27ae60; color: white; border: none; border-radius: 5px; cursor: pointer; }
+        .status-box { margin-top: 20px; color: #f1c40f; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <h1>Control de Seteo - Raspberry Pi 4</h1>
+    
+    <div class="panel">
+        <h3>Enviar nuevo Seteo</h3>
+        <input type="number" id="valorSeteo" placeholder="0-100">
+        <button onclick="enviarDato()">Enviar a Pico</button>
+        
+        <div class="status-box">
+            Estado Driver: <span id="statusTxt">Cargando...</span><br>
+            Último Seteo: <span id="lastSet">Ninguno</span>
+        </div>
+    </div>
+
+    <script>
+        // Actualiza el estado cada segundo
+        setInterval(() => {
+            fetch('/status').then(r => r.json()).then(data => {
+                document.getElementById('statusTxt').innerText = data.status;
+                document.getElementById('lastSet').innerText = data.ultimo_seteo;
+            });
+        }, 1000);
+
+        function enviarDato() {
+            let val = document.getElementById('valorSeteo').value;
+            let formData = new URLSearchParams();
+            formData.append('valor', val);
+
+            fetch('/enviar', {
+                method: 'POST',
+                body: formData
+            }).then(r => {
+                if(r.ok) alert("Comando enviado al driver con éxito");
+            });
+        }
+    </script>
+</body>
+</html>

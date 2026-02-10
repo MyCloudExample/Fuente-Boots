@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Monitor Pico EGB</title>
+    <style>
+        body { font-family: sans-serif; background: #1a1a1a; color: #eee; text-align: center; }
+        .card { border: 2px solid #00ff00; display: inline-block; padding: 20px; margin: 15px; border-radius: 15px; min-width: 150px; }
+        .valor { font-size: 2.5em; color: #00ff00; font-weight: bold; }
+        .panel-control { border: 2px solid #3498db; padding: 20px; margin-top: 20px; border-radius: 15px; display: inline-block; }
+        input { padding: 10px; width: 60px; font-size: 1.1em; }
+        button { padding: 10px 20px; background: #27ae60; color: white; border: none; cursor: pointer; }
+        #statusTxt { color: #f1c40f; font-style: italic; }
+    </style>
+</head>
+<body>
+    <h1>Monitor en Tiempo Real</h1>
+
+    <div class="card">
+        <h3>Voltaje</h3>
+        <div class="valor"><span id="v">0.0</span> V</div>
+    </div>
+
+    <div class="card">
+        <h3>Corriente</h3>
+        <div class="valor"><span id="i">0.0</span> A</div>
+    </div>
+
+    <br>
+
+    <div class="panel-control">
+        <h3>Configurar Seteo (S)</h3>
+        <input type="number" id="valorSeteo" step="0.1" placeholder="0.0">
+        <button onclick="enviarDato()">Enviar</button>
+        <p>Estado: <span id="statusTxt">Iniciando...</span></p>
+        <p>Último enviado: <span id="lastSet">Ninguno</span></p>
+    </div>
+
+    <script>
+        // 1. Función para ACTUALIZAR los datos en pantalla
+        setInterval(() => {
+            fetch('/status')
+                .then(response => response.json())
+                .then(data => {
+                    // Actualiza los textos usando los IDs que definimos arriba
+                    document.getElementById('v').innerText = data.voltaje;
+                    document.getElementById('i').innerText = data.corriente;
+                    document.getElementById('statusTxt').innerText = data.status;
+                    document.getElementById('lastSet').innerText = data.ultimo_seteo;
+                })
+                .catch(err => console.error("Error al obtener datos:", err));
+        }, 500); // Se ejecuta cada 500ms
+
+        // 2. Función para ENVIAR el seteo al servidor
+        function enviarDato() {
+            let val = document.getElementById('valorSeteo').value;
+            if(!val) { alert("Ingresa un valor"); return; }
+
+            let params = new URLSearchParams();
+            params.append('valor', val);
+
+            fetch('/enviar', {
+                method: 'POST',
+                body: params
+            }).then(res => {
+                if(res.ok) console.log("Seteo enviado");
+            });
+        }
+    </script>
+</body>
+</html>
