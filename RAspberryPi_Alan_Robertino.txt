@@ -5,3 +5,4 @@ Direccion Web: http://alan.local:5000
 Direccion Web Moto: http://192.168.138.35:5000/ (Moto e7)
 En la raspberry para conexion ssh usar:
 -ssh wilson@alan.local (para windows)
+-ssh wilson@192.168.138.35 (para la red moto)
